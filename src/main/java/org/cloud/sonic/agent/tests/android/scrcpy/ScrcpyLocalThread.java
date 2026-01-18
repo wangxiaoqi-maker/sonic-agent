@@ -98,7 +98,22 @@ public class ScrcpyLocalThread extends Thread {
         }
         AtomicBoolean isRetry = new AtomicBoolean(false);
         try {
-            iDevice.executeShellCommand("CLASSPATH=/data/local/tmp/sonic-android-scrcpy.jar app_process / com.genymobile.scrcpy.Server 1.23 log_level=info max_size=0 max_fps=60 tunnel_forward=true send_frame_meta=false control=false show_touches=false stay_awake=false power_off_on_close=false clipboard_autosync=false",
+            // 获取 Android SDK 版本，决定使用哪个 scrcpy 参数格式
+            String sdkVersionStr = iDevice.getProperty("ro.build.version.sdk");
+            int sdkVersion = 0;
+            try {
+                sdkVersion = Integer.parseInt(sdkVersionStr);
+            } catch (Exception e) {
+                log.warn("Failed to parse SDK version: {}", sdkVersionStr);
+            }
+            
+            // scrcpy 3.1 参数格式（兼容 Android 15+，SDK >= 35）
+            // 也向下兼容旧版本 Android
+            String scrcpyCommand = "CLASSPATH=/data/local/tmp/sonic-android-scrcpy.jar app_process / com.genymobile.scrcpy.Server 3.1 tunnel_forward=true video=true audio=false control=false max_size=800 max_fps=60";
+            
+            log.info("Starting scrcpy with SDK version: {}, command: {}", sdkVersion, scrcpyCommand);
+            
+            iDevice.executeShellCommand(scrcpyCommand,
                     new IShellOutputReceiver() {
                         @Override
                         public void addOutput(byte[] bytes, int i, int i1) {
@@ -107,7 +122,7 @@ public class ScrcpyLocalThread extends Thread {
                             if (res.contains("Device")) {
                                 isFinish.release();
                                 isRetry.set(true);
-                            } else if (!isRetry.get()) {
+                            } else if (!isRetry.get() && res.contains("ERROR")) {
                                 log.info("scrcpy服务启动失败！");
                                 JSONObject support = new JSONObject();
                                 support.put("msg", "support");
