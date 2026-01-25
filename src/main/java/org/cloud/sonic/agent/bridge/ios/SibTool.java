@@ -73,8 +73,21 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
     @Value("${modules.ios.wda-xcode-project-path:default}")
     private String getXcodeProjectPath;
 
+    // WDA Auto-Signing Configuration
+    @Value("${modules.ios.wda-auto-sign.enabled:false}")
+    private boolean getAutoSignEnabled;
+
+    @Value("${modules.ios.wda-auto-sign.development-team:}")
+    private String getDevelopmentTeam;
+
+    @Value("${modules.ios.wda-auto-sign.code-sign-identity:Apple Development}")
+    private String getCodeSignIdentity;
+
     private static String bundleId;
     private static String xcodeProjectPath;
+    private static boolean autoSignEnabled;
+    private static String developmentTeam;
+    private static String codeSignIdentity;
     private static File sibBinary = new File("plugins" + File.separator + "sonic-ios-bridge");
     private static String sib = sibBinary.getAbsolutePath();
     private static RestTemplate restTemplate;
@@ -87,6 +100,14 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
     public void setEnv() {
         bundleId = getBundleId;
         xcodeProjectPath = getXcodeProjectPath;
+        autoSignEnabled = getAutoSignEnabled;
+        developmentTeam = getDevelopmentTeam;
+        codeSignIdentity = getCodeSignIdentity;
+        
+        // Log configuration status
+        logger.info("WDA Auto-Signing: {} (Team ID: {})", 
+            autoSignEnabled ? "ENABLED" : "DISABLED",
+            developmentTeam != null && !developmentTeam.isEmpty() ? developmentTeam : "NOT_CONFIGURED");
     }
 
     @Override
@@ -242,28 +263,99 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
         final Process[] iProxyProcess = {null};
         String commandLine;
 
-        // ios17 support, but mac only
+        // iOS 17+ support with automatic code signing from source project
         if (isUpperThanIos17(udId)) {
-            commandLine = String.format(
-                    "xcodebuild -project %s -scheme WebDriverAgentRunner -destination 'id=%s' test",
-                    xcodeProjectPath, udId);
+            if (autoSignEnabled && developmentTeam != null && !developmentTeam.isEmpty() && !developmentTeam.equals("YOUR_TEAM_ID_HERE")) {
+                // Use xcodebuild with project source for true automatic signing
+                File wdaProject = new File("/Users/wangxiaoqi/Documents/github开源大模型/WebDriverAgent/WebDriverAgent.xcodeproj");
+                
+                if (!wdaProject.exists()) {
+                    logger.error("WDA project not found: {}. Falling back to manual mode.", wdaProject.getAbsolutePath());
+                    logger.warn("Please ensure WebDriverAgent project is available or use manual WDA mode.");
+                    
+                    // Fallback to manual mode
+                    commandLine = "/bin/echo \"ServerURLHere->\" && /bin/sleep 3600";
+                    try {
+                        String iproxyCmd = String.format("iproxy %d:8100 %d:9100 -u %s", wdaPort, mjpegPort, udId);
+                        logger.info("Starting iproxy for manual WDA mode: {}", iproxyCmd);
+                        Runtime.getRuntime().exec(iproxyCmd.split(" "));
+                    } catch (IOException e) {
+                        logger.error("Failed to start iproxy: {}", e.getMessage());
+                        e.printStackTrace();
+                    }
+                } else {
+                    // Build from source project with automatic signing
+                    commandLine = String.format(
+                        "xcodebuild " +
+                        "-project '%s' " +
+                        "-scheme WebDriverAgentRunner " +
+                        "-destination 'platform=iOS,id=%s' " +
+                        "-allowProvisioningUpdates " +
+                        "DEVELOPMENT_TEAM=%s " +
+                        "CODE_SIGN_IDENTITY='%s' " +
+                        "test",
+                        wdaProject.getAbsolutePath(),
+                        udId,
+                        developmentTeam,
+                        codeSignIdentity
+                    );
+                    
+                    logger.info("Building WDA from source with auto-signing for iOS 17+");
+                    logger.info("Project: {}", wdaProject.getAbsolutePath());
+                    logger.info("Team ID: {}, Sign Identity: {}", developmentTeam, codeSignIdentity);
+                }
+            } else {
+                // Fallback to manual mode (user must start WDA via Xcode)
+                logger.warn("WDA Auto-Signing is DISABLED or Team ID not configured. Using manual WDA mode.");
+                logger.warn("Please configure 'modules.ios.wda-auto-sign.development-team' in application-sonic-agent.yml");
+                logger.warn("OR manually start WDA via Xcode (Product -> Test)");
+                
+                commandLine = "/bin/echo \"ServerURLHere->\" && /bin/sleep 3600";
+                
+                // Start iproxy for manual WDA
+                try {
+                    String iproxyCmd = String.format("iproxy %d:8100 %d:9100 -u %s", wdaPort, mjpegPort, udId);
+                    logger.info("Starting iproxy for manual WDA mode: {}", iproxyCmd);
+                    Runtime.getRuntime().exec(iproxyCmd.split(" "));
+                } catch (IOException e) {
+                    logger.error("Failed to start iproxy: {}", e.getMessage());
+                    e.printStackTrace();
+                }
+            }
+
         } else {
+            System.out.println("DEBUG: isUpperThanIos17=false");
             commandLine = String.format(
                     "%s run wda -u %s -b %s --mjpeg-remote-port 9100 --server-remote-port 8100 --mjpeg-local-port %d --server-local-port %d",
                     sib, udId, bundleId, mjpegPort, wdaPort);
         }
+        System.out.println("DEBUG: Executing: " + commandLine);
         String system = System.getProperty("os.name").toLowerCase();
         if (system.contains("win")) {
             wdaProcess = Runtime.getRuntime().exec(new String[]{"cmd", "/c", commandLine});
         } else if (system.contains("linux") || system.contains("mac")) {
-            wdaProcess = Runtime.getRuntime().exec(new String[]{"sh", "-c", commandLine});
+            wdaProcess = Runtime.getRuntime().exec(new String[]{"/bin/sh", "-c", commandLine});
         }
         InputStreamReader inputStreamReader = new InputStreamReader(wdaProcess.getInputStream());
         BufferedReader stdInput = new BufferedReader(inputStreamReader);
+        InputStreamReader errorStreamReader = new InputStreamReader(wdaProcess.getErrorStream());
+        BufferedReader stdError = new BufferedReader(errorStreamReader);
         Semaphore isFinish = new Semaphore(0);
 
         int finalWdaPort = wdaPort;
         int finalMjpegPort = mjpegPort;
+        
+        // Print Stderr in a separate thread to avoid blocking
+        new Thread(() -> {
+            String s;
+            try {
+                while ((s = stdError.readLine()) != null) {
+                    System.out.println("DEBUG-STDERR: " + s);
+                }
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }).start();
 
         Thread wdaThread = new Thread(() -> {
             String s;

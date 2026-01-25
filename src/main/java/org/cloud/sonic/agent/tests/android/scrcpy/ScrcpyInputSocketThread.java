@@ -85,7 +85,12 @@ public class ScrcpyInputSocketThread extends Thread {
     }
 
     private static final int BUFFER_SIZE = 1024 * 1024 * 10;
-    private static final int READ_BUFFER_SIZE = 1024 * 5;
+    private static final int READ_BUFFER_SIZE = 1024 * 64;
+    
+    // scrcpy 3.1 协议常量
+    private static final int CODEC_ID_H264 = 0x68323634; // "h264" in big-endian
+    private static final int CODEC_META_SIZE = 12; // codec_id(4) + width(4) + height(4)
+    private static final int FRAME_HEADER_SIZE = 12; // pts(8) + size(4)
 
     @Override
     public void run() {
@@ -96,41 +101,134 @@ public class ScrcpyInputSocketThread extends Thread {
         try {
             videoSocket.connect(new InetSocketAddress("localhost", scrcpyPort));
             inputStream = videoSocket.getInputStream();
-            if (videoSocket.isConnected()) {
-                String sizeTotal = AndroidDeviceBridgeTool.getScreenSize(iDevice);
-                JSONObject size = new JSONObject();
-                size.put("msg", "size");
-                size.put("width", sizeTotal.split("x")[0]);
-                size.put("height", sizeTotal.split("x")[1]);
-                BytesTool.sendText(session, size.toJSONString());
+            
+            if (!videoSocket.isConnected()) {
+                log.error("Failed to connect to scrcpy socket");
+                return;
             }
-            int readLength;
-            int naLuIndex;
-            int bufferLength = 0;
-            byte[] buffer = new byte[BUFFER_SIZE];
+            
+            // ==== scrcpy 3.1 协议处理 ====
+            
+            // 1. 读取 dummy byte（tunnel_forward 模式下）
+            byte[] dummyByte = new byte[1];
+            int read = inputStream.read(dummyByte);
+            if (read != 1) {
+                log.error("Failed to read dummy byte from scrcpy");
+                return;
+            }
+            log.info("scrcpy dummy byte received: {}", dummyByte[0] & 0xFF);
+            
+            // 2. 读取 device metadata（设备名称，固定 64 字节）
+            // scrcpy 3.1 发送固定 64 字节，null-terminated UTF-8
+            byte[] deviceNameBytes = new byte[64];
+            int totalRead = 0;
+            while (totalRead < 64) {
+                read = inputStream.read(deviceNameBytes, totalRead, 64 - totalRead);
+                if (read <= 0) {
+                    log.error("Failed to read device name");
+                    return;
+                }
+                totalRead += read;
+            }
+            // 找到 null 终止符
+            int nameLen = 0;
+            for (int i = 0; i < 64; i++) {
+                if (deviceNameBytes[i] == 0) {
+                    nameLen = i;
+                    break;
+                }
+            }
+            if (nameLen == 0) nameLen = 64;
+            String deviceName = new String(deviceNameBytes, 0, nameLen, "UTF-8");
+            log.info("scrcpy device name: {}", deviceName);
+
+            
+            // 3. 读取 codec metadata (12 bytes)
+            byte[] codecMeta = new byte[CODEC_META_SIZE];
+            totalRead = 0;
+            while (totalRead < CODEC_META_SIZE) {
+                read = inputStream.read(codecMeta, totalRead, CODEC_META_SIZE - totalRead);
+                if (read <= 0) {
+                    log.error("Failed to read codec metadata");
+                    return;
+                }
+                totalRead += read;
+            }
+            
+            // 解析 codec metadata (big-endian)
+            int codecId = ((codecMeta[0] & 0xFF) << 24) | ((codecMeta[1] & 0xFF) << 16) | 
+                         ((codecMeta[2] & 0xFF) << 8) | (codecMeta[3] & 0xFF);
+            int videoWidth = ((codecMeta[4] & 0xFF) << 24) | ((codecMeta[5] & 0xFF) << 16) | 
+                            ((codecMeta[6] & 0xFF) << 8) | (codecMeta[7] & 0xFF);
+            int videoHeight = ((codecMeta[8] & 0xFF) << 24) | ((codecMeta[9] & 0xFF) << 16) | 
+                             ((codecMeta[10] & 0xFF) << 8) | (codecMeta[11] & 0xFF);
+            
+            log.info("scrcpy codec: 0x{}, size: {}x{}", Integer.toHexString(codecId), videoWidth, videoHeight);
+            
+            // 发送尺寸信息到前端
+            JSONObject size = new JSONObject();
+            size.put("msg", "size");
+            size.put("width", String.valueOf(videoWidth));
+            size.put("height", String.valueOf(videoHeight));
+            BytesTool.sendText(session, size.toJSONString());
+            
+            // 4. 读取视频帧（每帧有 12-byte header）
+            byte[] frameHeader = new byte[FRAME_HEADER_SIZE];
+            
             while (scrcpyLocalThread.isAlive()) {
-                readLength = inputStream.read(buffer, bufferLength, READ_BUFFER_SIZE);
-                if (readLength > 0) {
-                    bufferLength += readLength;
-                    for (int i = 5; i < bufferLength - 4; i++) {
-                        if (buffer[i] == 0x00 &&
-                                buffer[i + 1] == 0x00 &&
-                                buffer[i + 2] == 0x00 &&
-                                buffer[i + 3] == 0x01
-                        ) {
-                            naLuIndex = i;
-                            byte[] naluBuffer = new byte[naLuIndex];
-                            System.arraycopy(buffer, 0, naluBuffer, 0, naLuIndex);
-                            dataQueue.add(naluBuffer);
-                            bufferLength -= naLuIndex;
-                            System.arraycopy(buffer, naLuIndex, buffer, 0, bufferLength);
-                            i = 5;
-                        }
+                // 读取 frame header
+                totalRead = 0;
+                while (totalRead < FRAME_HEADER_SIZE) {
+                    read = inputStream.read(frameHeader, totalRead, FRAME_HEADER_SIZE - totalRead);
+                    if (read <= 0) {
+                        log.info("scrcpy stream ended");
+                        return;
+                    }
+                    totalRead += read;
+                }
+                
+                // 解析 frame header
+                // pts (8 bytes, big-endian) - 最高 2 bits 是 flags
+                // packet_size (4 bytes, big-endian)
+                long ptsAndFlags = 0;
+                for (int i = 0; i < 8; i++) {
+                    ptsAndFlags = (ptsAndFlags << 8) | (frameHeader[i] & 0xFF);
+                }
+                boolean isConfig = (ptsAndFlags & 0x8000000000000000L) != 0;
+                boolean isKeyFrame = (ptsAndFlags & 0x4000000000000000L) != 0;
+                
+                int packetSize = ((frameHeader[8] & 0xFF) << 24) | ((frameHeader[9] & 0xFF) << 16) | 
+                                ((frameHeader[10] & 0xFF) << 8) | (frameHeader[11] & 0xFF);
+                
+                if (packetSize <= 0 || packetSize > BUFFER_SIZE) {
+                    log.warn("Invalid packet size: {}", packetSize);
+                    continue;
+                }
+                
+                // 读取视频数据
+                byte[] packetData = new byte[packetSize];
+                totalRead = 0;
+                while (totalRead < packetSize) {
+                    read = inputStream.read(packetData, totalRead, packetSize - totalRead);
+                    if (read <= 0) {
+                        log.warn("Failed to read packet data, expected {} bytes, got {}", packetSize, totalRead);
+                        break;
+                    }
+                    totalRead += read;
+                }
+                
+                if (totalRead == packetSize) {
+                    // 发送数据到队列
+                    dataQueue.add(packetData);
+                    // 调试日志：打印前 10 帧的信息
+                    if (dataQueue.size() <= 10) {
+                        log.info("scrcpy frame received: size={}, isConfig={}, isKeyFrame={}, queueSize={}", 
+                            packetSize, isConfig, isKeyFrame, dataQueue.size());
                     }
                 }
             }
         } catch (IOException e) {
-            e.printStackTrace();
+            log.error("scrcpy socket error: {}", e.getMessage());
         } finally {
             if (scrcpyLocalThread.isAlive()) {
                 scrcpyLocalThread.interrupt();

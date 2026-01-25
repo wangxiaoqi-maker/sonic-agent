@@ -77,8 +77,11 @@ public class IOSWSServer implements IIOSWSServer {
     @OnOpen
     public void onOpen(Session session, @PathParam("key") String secretKey,
                        @PathParam("udId") String udId, @PathParam("token") String token) throws Exception {
+        System.out.println("DEBUG: IOSWSServer onOpen called!");
+        System.out.println("DEBUG: key=" + secretKey + ", udId=" + udId);
+        log.info("IOSWSServer onOpen: key={}, udId={}, token={}", secretKey, udId, token);
         if (secretKey.length() == 0 || (!secretKey.equals(key)) || token.length() == 0) {
-            log.info("Auth Failed!");
+            log.info("Auth Failed! Expected key: {}", key);
             return;
         }
 
@@ -160,7 +163,14 @@ public class IOSWSServer implements IIOSWSServer {
             }
         });
 
-        SibTool.startShare(udId, session);
+        if (SibTool.isUpperThanIos17(udId)) {
+            JSONObject shareJSON = new JSONObject();
+            shareJSON.put("msg", "share");
+            shareJSON.put("port", ports[1]);
+            BytesTool.sendText(session, shareJSON.toJSONString());
+        } else {
+            SibTool.startShare(udId, session);
+        }
 
     }
 
